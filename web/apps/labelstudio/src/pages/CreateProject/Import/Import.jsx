@@ -14,6 +14,9 @@ import { Button, CodeBlock, SimpleCard, Spinner, Tooltip, Typography, Badge } fr
 import truncate from "truncate-middle";
 import samples from "./samples.json";
 import { importFiles } from "./utils";
+import { iterateFileTree } from "./fileTraversal";
+import { createUploadQueue, uploadFileTus } from "./tusUpload";
+import { recordInflight, removeInflight, getInflight, clearInflight } from "./tusResume";
 
 const importClass = cn("upload_page");
 const dropzoneClass = cn("dropzone");
@@ -46,46 +49,7 @@ function getFileExtension(fileName) {
   return fileName.split(".").pop().toLowerCase();
 }
 
-function traverseFileTree(item, path) {
-  return new Promise((resolve) => {
-    path = path || "";
-    if (item.isFile) {
-      // Avoid hidden files
-      if (item.name[0] === ".") return resolve([]);
-
-      resolve([item]);
-    } else if (item.isDirectory) {
-      // Get folder contents
-      const dirReader = item.createReader();
-      const dirPath = `${path + item.name}/`;
-
-      dirReader.readEntries((entries) => {
-        Promise.all(entries.map((entry) => traverseFileTree(entry, dirPath)))
-          .then(flatten)
-          .then(resolve);
-      });
-    }
-  });
-}
-
-function getFiles(files) {
-  // @todo this can be not a files, but text or any other draggable stuff
-  return new Promise((resolve) => {
-    if (!files.length) return resolve([]);
-    if (!files[0].webkitGetAsEntry) return resolve(files);
-
-    // Use DataTransferItemList interface to access the file(s)
-    const entries = Array.from(files).map((file) => file.webkitGetAsEntry());
-
-    Promise.all(entries.map(traverseFileTree))
-      .then(flatten)
-      .then((fileEntries) => fileEntries.map((fileEntry) => new Promise((res) => fileEntry.file(res))))
-      .then((filePromises) => Promise.all(filePromises))
-      .then(resolve);
-  });
-}
-
-const Upload = ({ children, sendFiles }) => {
+const Upload = ({ children, onDropItems }) => {
   const [hovered, setHovered] = useState(false);
   const onHover = (e) => {
     e.preventDefault();
@@ -98,9 +62,12 @@ const Upload = ({ children, sendFiles }) => {
     (e) => {
       e.preventDefault();
       onLeave();
-      getFiles(e.dataTransfer.items).then((files) => sendFiles(files));
+      // Hand the raw DataTransferItemList straight through — the consumer
+      // iterates lazily (async generator) so we never materialise the full
+      // tree up front. See UPLOAD_FIX_DESIGN.md §A1.
+      onDropItems(e.dataTransfer.items);
     },
-    [onLeave, sendFiles],
+    [onLeave, onDropItems],
   );
 
   return (
@@ -139,6 +106,53 @@ const ErrorMessage = ({ error }) => {
   );
 };
 
+// Aggregate byte-transfer summary shown above the per-file list. See
+// UPLOAD_FIX_DESIGN.md §A5.
+const UploadProgressHeader = ({ stats, failedCount, onRetryAll }) => {
+  const hasTotals = stats && stats.totalFiles > 0;
+  if (!hasTotals && !failedCount) return null;
+  const remaining = Math.max(0, stats.totalBytes - stats.doneBytes);
+  let etaLabel = null;
+  if (hasTotals && stats.doneBytes > 0 && stats.startedAt) {
+    const elapsed = (Date.now() - stats.startedAt) / 1000;
+    if (elapsed > 5) {
+      const bytesPerSec = stats.doneBytes / elapsed;
+      if (bytesPerSec > 0) {
+        const etaSec = remaining / bytesPerSec;
+        const h = Math.floor(etaSec / 3600);
+        const m = Math.floor((etaSec % 3600) / 60);
+        etaLabel = `ETA ${h > 0 ? `${h}h ` : ""}${m}m`;
+      }
+    }
+  }
+  const doneFmt = formatFileSize(stats.doneBytes || 0);
+  const totalFmt = formatFileSize(stats.totalBytes || 0);
+  return (
+    <div
+      className="flex items-center gap-4 p-2 mb-2 border border-neutral-border-subtle rounded"
+      data-testid="tus-aggregate-header"
+    >
+      <Typography variant="body" size="small" className="flex-1">
+        {stats.doneFiles} of {stats.totalFiles} files{" "}
+        <span className="text-neutral-content-subtle">
+          | {doneFmt} / {totalFmt}
+          {etaLabel ? ` | ${etaLabel}` : ""}
+        </span>
+      </Typography>
+      {failedCount > 0 && (
+        <>
+          <Typography variant="body" size="small" className="text-negative-content">
+            {failedCount} failed
+          </Typography>
+          <Button size="smaller" look="outlined" onClick={onRetryAll} aria-label="Retry all failed uploads">
+            Retry all failed
+          </Button>
+        </>
+      )}
+    </div>
+  );
+};
+
 export const ImportPage = ({
   project,
   sample,
@@ -165,9 +179,18 @@ export const ImportPage = ({
       return { ...state, uploading: [...action.sending, ...state.uploading] };
     }
     if (action.sent) {
+      // `action.sent` is an array of File objects that just finished. Remove
+      // them from `uploading` AND clear any stale progress/failed entries so
+      // successful rows don't linger as failures and the aggregate stats
+      // stay coherent.
+      const sentNames = new Set(action.sent.map((f) => f.name));
+      const progress = { ...state.progress };
+      for (const n of sentNames) delete progress[n];
       return {
         ...state,
-        uploading: state.uploading.filter((f) => !action.sent.includes(f)),
+        uploading: state.uploading.filter((f) => !sentNames.has(f.name)),
+        failed: state.failed.filter((e) => !sentNames.has(e.file.name)),
+        progress,
       };
     }
     if (action.uploaded) {
@@ -178,19 +201,120 @@ export const ImportPage = ({
     }
     if (action.ids) {
       const ids = unique([...state.ids, ...action.ids]);
-
       onFileListUpdate?.(ids);
       return { ...state, ids };
     }
+    if (action.progress) {
+      const { name, loaded, total } = action.progress;
+      const prev = state.progress[name] || { loaded: 0, total: 0 };
+      // Aggregate doneBytes is sum of progress entries; recompute cheaply.
+      const nextProgress = { ...state.progress, [name]: { loaded, total } };
+      let doneBytes = 0;
+      let totalBytes = 0;
+      for (const p of Object.values(nextProgress)) {
+        doneBytes += p.loaded || 0;
+        totalBytes += p.total || 0;
+      }
+      return {
+        ...state,
+        progress: nextProgress,
+        stats: {
+          ...state.stats,
+          doneBytes,
+          totalBytes: Math.max(totalBytes, state.stats.totalBytes || 0),
+          startedAt: state.stats.startedAt || Date.now(),
+        },
+        _lastTick: prev.loaded, // noop keep
+      };
+    }
+    if (action.failed) {
+      const { file, error } = action.failed;
+      return {
+        ...state,
+        uploading: state.uploading.filter((f) => f.name !== file.name),
+        failed: [
+          ...state.failed.filter((e) => e.file.name !== file.name),
+          { file, error: String(error?.message ?? error ?? "Upload failed"), retries: 0 },
+        ],
+      };
+    }
+    if (action.retry) {
+      return {
+        ...state,
+        failed: state.failed.filter((e) => e.file.name !== action.retry.name),
+      };
+    }
+    if (action.bumpTotals) {
+      return {
+        ...state,
+        stats: {
+          ...state.stats,
+          totalFiles: (state.stats.totalFiles || 0) + action.bumpTotals.files,
+          totalBytes: (state.stats.totalBytes || 0) + action.bumpTotals.bytes,
+          startedAt: state.stats.startedAt || Date.now(),
+        },
+      };
+    }
+    if (action.bumpDone) {
+      return {
+        ...state,
+        stats: {
+          ...state.stats,
+          doneFiles: (state.stats.doneFiles || 0) + action.bumpDone,
+        },
+      };
+    }
+    if (action.resetStats) {
+      return { ...state, stats: initialStats(), progress: {} };
+    }
     return state;
   };
+
+  const initialStats = () => ({
+    totalFiles: 0,
+    doneFiles: 0,
+    totalBytes: 0,
+    doneBytes: 0,
+    startedAt: null,
+  });
 
   const [files, dispatch] = useReducer(processFiles, {
     uploaded: [],
     uploading: [],
     ids: [],
+    progress: {},
+    failed: [],
+    stats: initialStats(),
   });
-  const showList = Boolean(files.uploaded?.length || files.uploading?.length || sample);
+  const showList = Boolean(files.uploaded?.length || files.uploading?.length || files.failed?.length || sample);
+
+  // Abort controller + queue live across the lifetime of the modal instance.
+  const uploadQueueRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const getQueue = () => {
+    if (!uploadQueueRef.current) uploadQueueRef.current = createUploadQueue();
+    return uploadQueueRef.current;
+  };
+  const getAbortController = () => {
+    if (!abortControllerRef.current) abortControllerRef.current = new AbortController();
+    return abortControllerRef.current;
+  };
+  useEffect(() => {
+    return () => {
+      try {
+        abortControllerRef.current?.abort();
+      } catch (_) {
+        /* ignore */
+      }
+    };
+  }, []);
+
+  // Resume-on-reload state (§A4).
+  const [interrupted, setInterrupted] = useState([]);
+  useEffect(() => {
+    if (!project?.id) return;
+    setInterrupted(getInflight(project.id));
+  }, [project?.id]);
 
   const loadFilesList = useCallback(
     async (file_upload_ids) => {
@@ -293,32 +417,136 @@ export const ImportPage = ({
     [project, onFinish],
   );
 
-  const sendFiles = useCallback(
-    (files) => {
+  // Dispatch one File into the tus queue. Returns the queued Promise.
+  const enqueueOne = useCallback(
+    (file) => {
+      if (!allSupportedExtensions.includes(getFileExtension(file.name))) {
+        onError(new Error(`The filetype of file "${file.name}" is not supported.`));
+        return Promise.resolve(null);
+      }
+      dispatch({ sending: [file] });
+      dispatch({
+        progress: { name: file.name, loaded: 0, total: file.size || 0 },
+      });
+      dispatch({ bumpTotals: { files: 1, bytes: file.size || 0 } });
+
+      return getQueue().add(async () => {
+        try {
+          const { fileUploadId, resourceUrl } = await uploadFileTus({
+            file,
+            projectId: project.id,
+            abortSignal: getAbortController().signal,
+            onProgress: (f, loaded, total) => {
+              dispatch({ progress: { name: f.name, loaded, total } });
+              // Track per-project inflight so the Resume banner can recover
+              // this upload after a reload. Overwrites on every tick; the
+              // key is the fingerprint tus-js-client assigned (stored on the
+              // upload URL itself — we keep just filename + size for display).
+              try {
+                recordInflight(project.id, {
+                  fingerprint: `${project.id}:${f.name}:${f.size}`,
+                  filename: f.name,
+                  size: f.size,
+                  loaded,
+                  total,
+                });
+              } catch (_) { /* best-effort */ }
+            },
+          });
+
+          // Pull the new FileUpload record (shape-compatible with the legacy
+          // /file-uploads endpoint) so downstream state renders consistently.
+          const uploadedRow = await api.callApi("fileUploads", {
+            params: { pk: project.id, ids: JSON.stringify([fileUploadId]) },
+          });
+          if (uploadedRow && uploadedRow.length) {
+            dispatch({ uploaded: uploadedRow });
+            dispatch({ ids: uploadedRow.map((r) => r.id) });
+          } else {
+            dispatch({ ids: [fileUploadId] });
+          }
+          dispatch({ sent: [file] });
+          dispatch({ bumpDone: 1 });
+          try { removeInflight(project.id, `${project.id}:${file.name}:${file.size}`); } catch (_) {}
+          return { fileUploadId, resourceUrl };
+        } catch (err) {
+          if (err?.name === "AbortError") return null;
+          dispatch({ failed: { file, error: err } });
+          return null;
+        }
+      });
+    },
+    [api, project?.id],
+  );
+
+  // Consume the async generator, handing each File into the queue as soon as
+  // it arrives. This keeps memory bounded even for huge drag-drops.
+  const consumeItems = useCallback(
+    async (items) => {
       setError(null);
       onWaiting?.(true);
-      files = [...files]; // they can be array-like object
-      const fd = new FormData();
-
-      for (const f of files) {
-        if (!allSupportedExtensions.includes(getFileExtension(f.name))) {
-          onError(new Error(`The filetype of file "${f.name}" is not supported.`));
-          return;
+      dispatch({ resetStats: true });
+      let any = false;
+      try {
+        for await (const file of iterateFileTree(items)) {
+          if (!file) continue;
+          any = true;
+          enqueueOne(file);
         }
-        fd.append(f.name, f);
+      } catch (err) {
+        onError(err);
       }
-      return importFilesImmediately(files, fd);
+      // Wait for everything already queued to settle before announcing done.
+      // New enqueues added during the await (shouldn't happen mid-iteration,
+      // but p-queue's onIdle is safe to call repeatedly) all resolve.
+      await getQueue().onIdle();
+      onWaiting?.(false);
+      if (!any) return;
     },
-    [importFilesImmediately],
+    [enqueueOne, onWaiting],
+  );
+
+  // Back-compat wrapper: existing callers pass an Array<File> or FileList.
+  const sendFiles = useCallback(
+    (fileList) => {
+      consumeItems(fileList);
+    },
+    [consumeItems],
   );
 
   const onUpload = useCallback(
     (e) => {
-      sendFiles(e.target.files);
+      consumeItems(e.target.files);
       e.target.value = "";
     },
-    [sendFiles],
+    [consumeItems],
   );
+
+  const retryFailed = useCallback(
+    (file) => {
+      dispatch({ retry: file });
+      enqueueOne(file);
+    },
+    [enqueueOne],
+  );
+
+  const retryAllFailed = useCallback(() => {
+    const toRetry = [...files.failed.map((e) => e.file)];
+    for (const f of toRetry) retryFailed(f);
+  }, [files.failed, retryFailed]);
+
+  const dismissResumeBanner = useCallback(() => {
+    if (project?.id) clearInflight(project.id);
+    setInterrupted([]);
+  }, [project?.id]);
+
+  const resumeInterrupted = useCallback(() => {
+    // True resume requires re-selecting the File (the Blob/File object is
+    // never persisted in localStorage). We surface the list so the user can
+    // drag the same files again; tus-js-client will resume from the stored
+    // offset automatically once it sees the matching fingerprint.
+    document.getElementById("file-input")?.click();
+  }, []);
 
   const onLoadURL = useCallback(
     (e) => {
@@ -422,7 +650,7 @@ export const ImportPage = ({
       <ErrorMessage error={error} />
 
       <main>
-        <Upload sendFiles={sendFiles} project={project}>
+        <Upload onDropItems={consumeItems} project={project}>
           <div
             className={scn("flex gap-4 w-full min-h-full", {
               "justify-center": !showList,
@@ -522,6 +750,23 @@ export const ImportPage = ({
 
             {showList && (
               <div className="w-full">
+                {interrupted.length > 0 && (
+                  <div
+                    className="flex items-center gap-4 p-3 mb-3 border border-warning-border-subtle bg-warning-background rounded"
+                    data-testid="tus-resume-banner"
+                  >
+                    <Typography variant="body" size="small" className="flex-1">
+                      Resume {interrupted.length} interrupted upload{interrupted.length === 1 ? "" : "s"}
+                    </Typography>
+                    <Button size="smaller" look="outlined" onClick={resumeInterrupted}>
+                      Resume
+                    </Button>
+                    <Button size="smaller" variant="negative" look="outlined" onClick={dismissResumeBanner}>
+                      Dismiss
+                    </Button>
+                  </div>
+                )}
+                <UploadProgressHeader stats={files.stats} failedCount={files.failed.length} onRetryAll={retryAllFailed} />
                 <SimpleCard
                   title="Files"
                   className="w-full h-full"
@@ -586,6 +831,8 @@ export const ImportPage = ({
                           FILENAME_TRUNCATE_END,
                           "...",
                         );
+                        const p = files.progress[file.name] || { loaded: 0, total: file.size || 0 };
+                        const pct = p.total > 0 ? Math.min(100, Math.round((p.loaded * 100) / p.total)) : null;
                         return (
                           <tr key={`${idx}-${file.name}`}>
                             <td className={importClass.elem("file-name").toClassName()}>
@@ -595,12 +842,58 @@ export const ImportPage = ({
                                 </Typography>
                               </Tooltip>
                             </td>
-                            <td>
-                              <span
-                                className={importClass.elem("file-status").mod({ uploading: true }).toClassName()}
-                              />
+                            <td style={{ minWidth: 160 }}>
+                              {pct == null ? (
+                                <span
+                                  className={importClass.elem("file-status").mod({ uploading: true }).toClassName()}
+                                />
+                              ) : (
+                                <div className="flex items-center gap-2" data-testid={`tus-progress-${file.name}`}>
+                                  <progress value={p.loaded} max={p.total} style={{ width: 120, height: 8 }} />
+                                  <Typography variant="body" size="smaller">{pct}%</Typography>
+                                </div>
+                              )}
                             </td>
-                            <td className={importClass.elem("file-size").toClassName()}>&nbsp;</td>
+                            <td className={importClass.elem("file-size").toClassName()}>
+                              <Typography variant="body" size="smaller" className="text-nowrap text-neutral-content-subtle text-right">
+                                {p.total ? `${formatFileSize(p.loaded)} / ${formatFileSize(p.total)}` : ""}
+                              </Typography>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {files.failed.map((entry, idx) => {
+                        const truncatedFilename = truncate(
+                          entry.file.name,
+                          FILENAME_TRUNCATE_START,
+                          FILENAME_TRUNCATE_END,
+                          "...",
+                        );
+                        return (
+                          <tr key={`failed-${idx}-${entry.file.name}`} data-testid={`tus-failed-${entry.file.name}`}>
+                            <td className={importClass.elem("file-name").toClassName()}>
+                              <Tooltip title={`${entry.file.name}: ${entry.error}`}>
+                                <Typography variant="body" size="small" className="truncate text-negative-content">
+                                  <IconErrorAlt width="14" height="14" className="inline mr-1 align-middle" />
+                                  {truncatedFilename}
+                                </Typography>
+                              </Tooltip>
+                            </td>
+                            <td>
+                              <Button
+                                size="smaller"
+                                look="outlined"
+                                onClick={() => retryFailed(entry.file)}
+                                aria-label={`Retry upload of ${entry.file.name}`}
+                              >
+                                Retry
+                              </Button>
+                            </td>
+                            <td className={importClass.elem("file-size").toClassName()}>
+                              <Typography variant="body" size="smaller" className="text-nowrap text-negative-content text-right">
+                                Failed
+                              </Typography>
+                            </td>
                           </tr>
                         );
                       })}
