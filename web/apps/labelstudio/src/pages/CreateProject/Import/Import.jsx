@@ -181,16 +181,28 @@ export const ImportPage = ({
     if (action.sent) {
       // `action.sent` is an array of File objects that just finished. Remove
       // them from `uploading` AND clear any stale progress/failed entries so
-      // successful rows don't linger as failures and the aggregate stats
-      // stay coherent.
+      // successful rows don't linger as failures. Fold their final `loaded`
+      // byte count into `stats.completedBytes` so the aggregate doneBytes
+      // stays cumulative even after we drop the entries (otherwise the
+      // "X / Y" byte readout jumps back to ~zero each time a batch finishes
+      // and the ETA becomes nonsense).
       const sentNames = new Set(action.sent.map((f) => f.name));
       const progress = { ...state.progress };
-      for (const n of sentNames) delete progress[n];
+      let sentBytes = 0;
+      for (const n of sentNames) {
+        const p = progress[n];
+        if (p) sentBytes += p.loaded || 0;
+        delete progress[n];
+      }
       return {
         ...state,
         uploading: state.uploading.filter((f) => !sentNames.has(f.name)),
         failed: state.failed.filter((e) => !sentNames.has(e.file.name)),
         progress,
+        stats: {
+          ...state.stats,
+          completedBytes: (state.stats.completedBytes || 0) + sentBytes,
+        },
       };
     }
     if (action.uploaded) {
@@ -206,25 +218,25 @@ export const ImportPage = ({
     }
     if (action.progress) {
       const { name, loaded, total } = action.progress;
-      const prev = state.progress[name] || { loaded: 0, total: 0 };
-      // Aggregate doneBytes is sum of progress entries; recompute cheaply.
       const nextProgress = { ...state.progress, [name]: { loaded, total } };
-      let doneBytes = 0;
-      let totalBytes = 0;
+      // doneBytes = bytes already committed (completedBytes) + bytes in-flight
+      // right now. This stays monotonically non-decreasing across the lifetime
+      // of a batch because completed files no longer appear in `progress`
+      // after the `sent` action folds their size into completedBytes.
+      let inflight = 0;
       for (const p of Object.values(nextProgress)) {
-        doneBytes += p.loaded || 0;
-        totalBytes += p.total || 0;
+        inflight += p.loaded || 0;
       }
+      const doneBytes = (state.stats.completedBytes || 0) + inflight;
       return {
         ...state,
         progress: nextProgress,
         stats: {
           ...state.stats,
           doneBytes,
-          totalBytes: Math.max(totalBytes, state.stats.totalBytes || 0),
+          // totalBytes is owned by bumpTotals, do not overwrite here.
           startedAt: state.stats.startedAt || Date.now(),
         },
-        _lastTick: prev.loaded, // noop keep
       };
     }
     if (action.failed) {
@@ -275,6 +287,7 @@ export const ImportPage = ({
     doneFiles: 0,
     totalBytes: 0,
     doneBytes: 0,
+    completedBytes: 0, // cumulative bytes for already-finished files
     startedAt: null,
   });
 
