@@ -516,8 +516,14 @@ export const ImportPage = ({
 
   const onUpload = useCallback(
     (e) => {
-      consumeItems(e.target.files);
+      // Snapshot the FileList into a plain Array BEFORE clearing the input's
+      // value — setting `value = ""` empties the live FileList reference, and
+      // `consumeItems` iterates it asynchronously, so without this snapshot
+      // only the first file (if any) makes it through before the list is
+      // truncated to length 0.
+      const picked = Array.from(e.target.files || []);
       e.target.value = "";
+      consumeItems(picked);
     },
     [consumeItems],
   );
