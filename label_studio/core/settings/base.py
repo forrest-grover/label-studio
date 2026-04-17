@@ -244,6 +244,7 @@ INSTALLED_APPS = [
     'ml_model_providers',
     'jwt_auth',
     'session_policy',
+    'data_import.tus_app.apps.TusAppConfig',
 ]
 
 MIDDLEWARE = [
@@ -542,6 +543,21 @@ os.makedirs(os.path.join(BASE_DATA_DIR, MEDIA_ROOT, DELAYED_EXPORT_DIR), exist_o
 DATA_UPLOAD_MAX_MEMORY_SIZE = int(get_env('DATA_UPLOAD_MAX_MEMORY_SIZE', 250 * 1024 * 1024))
 DATA_UPLOAD_MAX_NUMBER_FILES = int(get_env('DATA_UPLOAD_MAX_NUMBER_FILES', 100))
 TASKS_MAX_NUMBER = 1000000
+
+# --- tus resumable upload settings (see data_import/tus_app) -------------------
+# Per-file ceiling enforced at tus creation time.
+TUS_MAX_SIZE = int(get_env('TUS_MAX_SIZE', 2 * 1024 * 1024 * 1024))  # 2 GiB
+# Temp dir for partial chunk assembly; kept on the same volume as MEDIA_ROOT
+# so that the final rename into MEDIA_ROOT/upload/... is a same-filesystem move.
+TUS_UPLOAD_DIR = get_env('TUS_UPLOAD_DIR', os.path.join(MEDIA_ROOT, 'tus-tmp'))
+os.makedirs(TUS_UPLOAD_DIR, exist_ok=True)
+# Destination dir is unused in practice — we immediately hand the assembled file
+# to ``create_file_upload`` which copies it into MEDIA_ROOT/upload/<project>/ —
+# but the app check requires it to be set.
+TUS_DESTINATION_DIR = get_env('TUS_DESTINATION_DIR', os.path.join(MEDIA_ROOT, 'tus-tmp'))
+os.makedirs(TUS_DESTINATION_DIR, exist_ok=True)
+# Max time a partial upload lives before being evicted (seconds).
+TUS_TIMEOUT = int(get_env('TUS_TIMEOUT', 24 * 60 * 60))  # 24h
 TASKS_MAX_FILE_SIZE = DATA_UPLOAD_MAX_MEMORY_SIZE
 
 TASK_LOCK_TTL = int(get_env('TASK_LOCK_TTL', default=86400))
