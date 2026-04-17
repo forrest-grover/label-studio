@@ -186,18 +186,25 @@ export const ImportPage = ({
       // stays cumulative even after we drop the entries (otherwise the
       // "X / Y" byte readout jumps back to ~zero each time a batch finishes
       // and the ETA becomes nonsense).
-      const sentNames = new Set(action.sent.map((f) => f.name));
+      //
+      // Indexing by `_tusKey` (a monotonic counter attached at enqueue time),
+      // NOT by `file.name` — 8000-image stress datasets routinely have
+      // duplicate basenames across subdirectories (w0/img_001.png,
+      // w1/img_001.png, ...). Indexing by name conflates them: finishing one
+      // would remove all of them from `uploading` and double-count their
+      // bytes in completedBytes.
+      const sentKeys = new Set(action.sent.map((f) => f._tusKey));
       const progress = { ...state.progress };
       let sentBytes = 0;
-      for (const n of sentNames) {
-        const p = progress[n];
+      for (const k of sentKeys) {
+        const p = progress[k];
         if (p) sentBytes += p.loaded || 0;
-        delete progress[n];
+        delete progress[k];
       }
       return {
         ...state,
-        uploading: state.uploading.filter((f) => !sentNames.has(f.name)),
-        failed: state.failed.filter((e) => !sentNames.has(e.file.name)),
+        uploading: state.uploading.filter((f) => !sentKeys.has(f._tusKey)),
+        failed: state.failed.filter((e) => !sentKeys.has(e.file._tusKey)),
         progress,
         stats: {
           ...state.stats,
@@ -217,8 +224,8 @@ export const ImportPage = ({
       return { ...state, ids };
     }
     if (action.progress) {
-      const { name, loaded, total } = action.progress;
-      const nextProgress = { ...state.progress, [name]: { loaded, total } };
+      const { key, loaded, total } = action.progress;
+      const nextProgress = { ...state.progress, [key]: { loaded, total } };
       // doneBytes = bytes already committed (completedBytes) + bytes in-flight
       // right now. This stays monotonically non-decreasing across the lifetime
       // of a batch because completed files no longer appear in `progress`
@@ -243,9 +250,9 @@ export const ImportPage = ({
       const { file, error } = action.failed;
       return {
         ...state,
-        uploading: state.uploading.filter((f) => f.name !== file.name),
+        uploading: state.uploading.filter((f) => f._tusKey !== file._tusKey),
         failed: [
-          ...state.failed.filter((e) => e.file.name !== file.name),
+          ...state.failed.filter((e) => e.file._tusKey !== file._tusKey),
           { file, error: String(error?.message ?? error ?? "Upload failed"), retries: 0 },
         ],
       };
@@ -253,7 +260,7 @@ export const ImportPage = ({
     if (action.retry) {
       return {
         ...state,
-        failed: state.failed.filter((e) => e.file.name !== action.retry.name),
+        failed: state.failed.filter((e) => e.file._tusKey !== action.retry._tusKey),
       };
     }
     if (action.bumpTotals) {
@@ -304,6 +311,9 @@ export const ImportPage = ({
   // Abort controller + queue live across the lifetime of the modal instance.
   const uploadQueueRef = useRef(null);
   const abortControllerRef = useRef(null);
+  // Monotonic counter for _tusKey — gives each File a stable unique id even
+  // when two files share the same basename (w0/img_001.png vs w1/img_001.png).
+  const fileKeySeq = useRef(0);
   const getQueue = () => {
     if (!uploadQueueRef.current) uploadQueueRef.current = createUploadQueue();
     return uploadQueueRef.current;
@@ -437,9 +447,21 @@ export const ImportPage = ({
         onError(new Error(`The filetype of file "${file.name}" is not supported.`));
         return Promise.resolve(null);
       }
+      // Stable unique key for reducer indexing. Filenames alone are not unique
+      // when a user drags in e.g. 10 subdirs that each contain `img_001.png`.
+      // File objects are frozen so we install the key via defineProperty with
+      // a try/catch fallback for exotic browser File implementations.
+      if (!file._tusKey) {
+        const k = `f${++fileKeySeq.current}`;
+        try {
+          Object.defineProperty(file, "_tusKey", { value: k, configurable: false });
+        } catch (_) {
+          file._tusKey = k; /* eslint-disable-line no-param-reassign */
+        }
+      }
       dispatch({ sending: [file] });
       dispatch({
-        progress: { name: file.name, loaded: 0, total: file.size || 0 },
+        progress: { key: file._tusKey, loaded: 0, total: file.size || 0 },
       });
       dispatch({ bumpTotals: { files: 1, bytes: file.size || 0 } });
 
@@ -450,7 +472,7 @@ export const ImportPage = ({
             projectId: project.id,
             abortSignal: getAbortController().signal,
             onProgress: (f, loaded, total) => {
-              dispatch({ progress: { name: f.name, loaded, total } });
+              dispatch({ progress: { key: f._tusKey, loaded, total } });
               // Track per-project inflight so the Resume banner can recover
               // this upload after a reload. Overwrites on every tick; the
               // key is the fingerprint tus-js-client assigned (stored on the
@@ -493,12 +515,15 @@ export const ImportPage = ({
   );
 
   // Consume the async generator, handing each File into the queue as soon as
-  // it arrives. This keeps memory bounded even for huge drag-drops.
+  // it arrives. This keeps memory bounded even for huge drag-drops. Stats are
+  // additive across successive calls — if the user clicks "Upload More Files"
+  // (or the test harness batches a huge drop), the aggregate counter should
+  // keep climbing, not snap back to zero. initialStats() runs once on mount
+  // which already handles the fresh-session case.
   const consumeItems = useCallback(
     async (items) => {
       setError(null);
       onWaiting?.(true);
-      dispatch({ resetStats: true });
       let any = false;
       try {
         for await (const file of iterateFileTree(items)) {
@@ -843,17 +868,17 @@ export const ImportPage = ({
                           </tr>
                         );
                       })}
-                      {files.uploading.map((file, idx) => {
+                      {files.uploading.map((file) => {
                         const truncatedFilename = truncate(
                           file.name,
                           FILENAME_TRUNCATE_START,
                           FILENAME_TRUNCATE_END,
                           "...",
                         );
-                        const p = files.progress[file.name] || { loaded: 0, total: file.size || 0 };
+                        const p = files.progress[file._tusKey] || { loaded: 0, total: file.size || 0 };
                         const pct = p.total > 0 ? Math.min(100, Math.round((p.loaded * 100) / p.total)) : null;
                         return (
-                          <tr key={`${idx}-${file.name}`}>
+                          <tr key={file._tusKey}>
                             <td className={importClass.elem("file-name").toClassName()}>
                               <Tooltip title={file.name}>
                                 <Typography variant="body" size="small" className="truncate">
@@ -881,7 +906,7 @@ export const ImportPage = ({
                           </tr>
                         );
                       })}
-                      {files.failed.map((entry, idx) => {
+                      {files.failed.map((entry) => {
                         const truncatedFilename = truncate(
                           entry.file.name,
                           FILENAME_TRUNCATE_START,
@@ -889,7 +914,7 @@ export const ImportPage = ({
                           "...",
                         );
                         return (
-                          <tr key={`failed-${idx}-${entry.file.name}`} data-testid={`tus-failed-${entry.file.name}`}>
+                          <tr key={`failed-${entry.file._tusKey}`} data-testid={`tus-failed-${entry.file.name}`}>
                             <td className={importClass.elem("file-name").toClassName()}>
                               <Tooltip title={`${entry.file.name}: ${entry.error}`}>
                                 <Typography variant="body" size="small" className="truncate text-negative-content">
