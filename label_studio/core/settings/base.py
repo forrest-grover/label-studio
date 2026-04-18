@@ -561,6 +561,12 @@ TUS_TIMEOUT = int(get_env('TUS_TIMEOUT', 24 * 60 * 60))  # 24h
 # Orphan janitor: delete .meta/.data pairs whose .meta mtime is older than this
 # many days (see data_import/tus_app/janitor.py and TUS-003).
 TUS_ORPHAN_TTL_DAYS = int(get_env('TUS_ORPHAN_TTL_DAYS', 7))
+# Server-side dedup window (hours). On tus finalize, if an existing FileUpload
+# row in the same project has the same client-sent fingerprint and was created
+# within this many hours, we reuse it instead of creating a second row. Catches
+# the XHR-in-flight-on-unload race the client-side index in TUS-001/TUS-004
+# cannot cover (see data_import/tus_app/receivers.py and TUS-005).
+TUS_SERVER_DEDUP_WINDOW_HOURS = int(get_env('TUS_SERVER_DEDUP_WINDOW_HOURS', 24))
 TASKS_MAX_FILE_SIZE = DATA_UPLOAD_MAX_MEMORY_SIZE
 
 TASK_LOCK_TTL = int(get_env('TASK_LOCK_TTL', default=86400))

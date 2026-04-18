@@ -66,6 +66,12 @@ export function uploadFileTus({
         filename: file.name,
         filetype: file.type || "application/octet-stream",
         projectId: String(projectId),
+        // TUS-005: pass the client-computed dedup fingerprint as a tus
+        // Upload-Metadata field. The server uses it for (project_id,
+        // fingerprint) idempotency when the client's own onSuccess handler
+        // never runs (final-chunk PATCH in flight at reload time). Reuse the
+        // shared helper so the formula matches the client-side index.
+        lsFingerprint: fingerprintForFile(file),
       },
       headers: {
         // Session cookie is sent automatically (same-origin). tus-js-client

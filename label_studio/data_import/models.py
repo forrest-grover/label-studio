@@ -34,6 +34,27 @@ class FileUpload(models.Model):
     user = models.ForeignKey('users.User', related_name='file_uploads', on_delete=models.CASCADE)
     project = models.ForeignKey('projects.Project', related_name='file_uploads', on_delete=models.CASCADE)
     file = models.FileField(upload_to=upload_name_generator)
+    # Client-computed dedup fingerprint: "<name>:<size>:<lastModified>" (see
+    # web/.../completedFingerprints.js `fingerprintForFile`). Populated by the
+    # tus finalize receiver from Upload-Metadata. Nullable so legacy clients
+    # (or non-tus upload paths) that don't set it keep working; dedup simply
+    # doesn't apply when it's null. Indexed jointly with `project` for O(log n)
+    # TUS-005 dedup lookups; see data_import/tus_app/receivers.py.
+    fingerprint = models.CharField(max_length=512, null=True, blank=True, db_index=False)
+    # Finalized-row creation time. Added in TUS-005 alongside `fingerprint` so
+    # the server-side dedup window (TUS_SERVER_DEDUP_WINDOW_HOURS) can filter
+    # "recent" rows without a related-model hop. Also closes the TUS-003 note
+    # about the missing timestamp on FileUpload. auto_now_add so imports that
+    # bulk-create (rare) still get a sensible default.
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+
+    class Meta:
+        indexes = [
+            # TUS-005: composite index for `(project_id, fingerprint)` dedup
+            # lookup. The tus finalize receiver always scopes by project so a
+            # single composite index is the only needed access path.
+            models.Index(fields=['project', 'fingerprint'], name='data_import_fu_proj_fp_idx'),
+        ]
 
     def has_permission(self, user):
         user.project = self.project  # link for activity log
