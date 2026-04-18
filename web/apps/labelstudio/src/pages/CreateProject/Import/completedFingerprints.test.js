@@ -10,12 +10,22 @@ import {
   pruneExpired,
   keyForProject,
   fingerprintForFile,
+  _flushForTests,
+  _resetForTests,
 } from "./completedFingerprints";
 
 const DAY = 24 * 60 * 60 * 1000;
 
+// The production hot path is debounced (TUS-002) — tests call this helper to
+// read back what markComplete has recorded on disk.
+function flush() {
+  _flushForTests();
+}
+
 describe("completedFingerprints", () => {
   beforeEach(() => {
+    // Reset both in-memory mirror and localStorage so tests don't bleed.
+    _resetForTests();
     localStorage.clear();
   });
 
@@ -79,6 +89,7 @@ describe("completedFingerprints", () => {
   test("re-marking the same fingerprint refreshes its timestamp instead of appending", () => {
     markComplete(7, "a.jpg:100:1000");
     markComplete(7, "a.jpg:100:1000");
+    flush();
     const entries = JSON.parse(localStorage.getItem(keyForProject(7)));
     expect(entries).toHaveLength(1);
   });
@@ -99,5 +110,39 @@ describe("completedFingerprints", () => {
   test("fingerprintForFile falls back to 0 for missing lastModified", () => {
     const f = { name: "a.jpg", size: 100 };
     expect(fingerprintForFile(f)).toBe("a.jpg:100:0");
+  });
+
+  // --- TUS-002: per-project cap + FIFO eviction ---------------------------
+
+  test("markComplete caps the per-project index and evicts the oldest entries (FIFO)", () => {
+    // Write MAX_ENTRIES + overflow unique fingerprints. The first
+    // `overflow` fingerprints should be evicted; the rest must survive.
+    const MAX = 5000;
+    const overflow = 120;
+    for (let i = 0; i < MAX + overflow; i++) {
+      markComplete(42, `f${i}.jpg:1:1`);
+    }
+    flush();
+    const entries = JSON.parse(localStorage.getItem(keyForProject(42)));
+    expect(entries).toHaveLength(MAX);
+    // Oldest `overflow` entries evicted.
+    expect(isDuplicate(42, "f0.jpg:1:1")).toBe(false);
+    expect(isDuplicate(42, `f${overflow - 1}.jpg:1:1`)).toBe(false);
+    // First surviving entry and the newest are still there.
+    expect(isDuplicate(42, `f${overflow}.jpg:1:1`)).toBe(true);
+    expect(isDuplicate(42, `f${MAX + overflow - 1}.jpg:1:1`)).toBe(true);
+  });
+
+  test("re-marking an existing fingerprint moves it to MRU so it isn't evicted first", () => {
+    const MAX = 5000;
+    for (let i = 0; i < MAX; i++) markComplete(42, `f${i}.jpg:1:1`);
+    // Refresh the oldest entry — it should now sit at the MRU end.
+    markComplete(42, "f0.jpg:1:1");
+    // Push one more entry past the cap; the oldest *now* is f1, not f0.
+    markComplete(42, "new.jpg:1:1");
+    flush();
+    expect(isDuplicate(42, "f0.jpg:1:1")).toBe(true);
+    expect(isDuplicate(42, "f1.jpg:1:1")).toBe(false);
+    expect(isDuplicate(42, "new.jpg:1:1")).toBe(true);
   });
 });
