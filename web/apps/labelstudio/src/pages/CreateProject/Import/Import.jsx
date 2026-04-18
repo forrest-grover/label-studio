@@ -25,6 +25,13 @@ const dropzoneClass = cn("dropzone");
 const FLASH_ANIMATION_DURATION = 2000; // 2 seconds
 const FILENAME_TRUNCATE_START = 24;
 const FILENAME_TRUNCATE_END = 24;
+// Cap the number of "uploaded" rows we actually render. For 8000-file imports
+// the DOM cost of rendering every completed row was visible in profiling —
+// each progress tick from any in-flight file re-renders the whole table, and
+// React's reconciliation over thousands of <tr> nodes dominated upload
+// throughput (down to ~3 files/s). Show the most recent N successes plus a
+// summary row for the rest.
+const MAX_RENDERED_UPLOADED_ROWS = 50;
 
 function flatten(nested) {
   return [].concat(...nested);
@@ -466,13 +473,28 @@ export const ImportPage = ({
       dispatch({ bumpTotals: { files: 1, bytes: file.size || 0 } });
 
       return getQueue().add(async () => {
+        // Per-file progress throttle. tus-js-client emits onProgress at the
+        // native rate (many ticks per second per chunk); with 4 concurrent
+        // uploads and 8000 already-rendered rows, the React reconciliation
+        // cost of every tick dominates upload throughput. Rate-limit to
+        // PROGRESS_THROTTLE_MS and always forward the last reported value on
+        // success so the row settles at 100%.
+        let lastDispatchAt = 0;
+        let pendingProgress = null;
+        const PROGRESS_THROTTLE_MS = 100;
         try {
           const { fileUploadId, resourceUrl } = await uploadFileTus({
             file,
             projectId: project.id,
             abortSignal: getAbortController().signal,
             onProgress: (f, loaded, total) => {
-              dispatch({ progress: { key: f._tusKey, loaded, total } });
+              pendingProgress = { key: f._tusKey, loaded, total };
+              const now = Date.now();
+              if (now - lastDispatchAt >= PROGRESS_THROTTLE_MS) {
+                lastDispatchAt = now;
+                dispatch({ progress: pendingProgress });
+                pendingProgress = null;
+              }
               // Track per-project inflight so the Resume banner can recover
               // this upload after a reload. Overwrites on every tick; the
               // key is the fingerprint tus-js-client assigned (stored on the
@@ -488,6 +510,8 @@ export const ImportPage = ({
               } catch (_) { /* best-effort */ }
             },
           });
+          // Flush any coalesced trailing tick so the final percent is shown.
+          if (pendingProgress) dispatch({ progress: pendingProgress });
 
           // Pull the new FileUpload record (shape-compatible with the legacy
           // /file-uploads endpoint) so downstream state renders consistently.
@@ -834,7 +858,15 @@ export const ImportPage = ({
                           </td>
                         </tr>
                       )}
-                      {files.uploaded.map((file) => {
+                      {files.uploaded.length > MAX_RENDERED_UPLOADED_ROWS && (
+                        <tr data-testid="tus-uploaded-summary">
+                          <td colSpan={3} className="text-neutral-content-subtle italic py-2">
+                            {files.uploaded.length - MAX_RENDERED_UPLOADED_ROWS} earlier uploaded files hidden
+                            (showing most recent {MAX_RENDERED_UPLOADED_ROWS})
+                          </td>
+                        </tr>
+                      )}
+                      {files.uploaded.slice(-MAX_RENDERED_UPLOADED_ROWS).map((file) => {
                         const truncatedFilename = truncate(
                           file.file,
                           FILENAME_TRUNCATE_START,
