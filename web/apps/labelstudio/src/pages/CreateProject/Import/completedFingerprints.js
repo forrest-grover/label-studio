@@ -68,7 +68,11 @@ function safeParse(raw) {
 const memIndex = new Map();
 const dirtyProjects = new Set();
 let flushTimer = null;
-let unloadHookInstalled = false;
+// Module-scoped guard: the `pagehide` listener must be installed exactly
+// once per tab for the life of the module, regardless of how many React
+// mounts call into us. Re-registering on every mount would leak listeners
+// across HMR / route remounts.
+let _listenerRegistered = false;
 
 function hydrate(projectId) {
   if (memIndex.has(projectId)) return memIndex.get(projectId);
@@ -84,30 +88,27 @@ function hydrate(projectId) {
   return m;
 }
 
-function scheduleFlush() {
-  if (!hasStorage()) return;
-  if (!unloadHookInstalled && typeof window !== "undefined") {
-    // Best-effort flush on page-hide so a user reload-mid-upload doesn't
-    // lose recent completions. `pagehide` fires in more cases than
-    // `beforeunload` (incl. bfcache) and is the modern recommendation.
-    const flushAll = () => flushNow();
-    window.addEventListener("pagehide", flushAll);
-    window.addEventListener("beforeunload", flushAll);
-    unloadHookInstalled = true;
-  }
-  if (flushTimer != null) return;
-  flushTimer = setTimeout(() => {
-    flushTimer = null;
-    flushNow();
-  }, FLUSH_DEBOUNCE_MS);
-}
-
-function flushNow() {
-  if (!hasStorage()) return;
+/**
+ * Synchronously write any pending in-memory deltas to localStorage and
+ * cancel the pending debounce timer. Idempotent: safe to call any number
+ * of times, and safe to call when nothing is dirty (in which case it
+ * simply clears the timer if one is pending and returns).
+ *
+ * Exported so both the `pagehide` listener and any explicit shutdown path
+ * (tests, future SPA navigation hooks) can force a flush.
+ */
+export function flushNow() {
   if (flushTimer != null) {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
+  if (!hasStorage()) {
+    // No storage available: clear dirty set so we don't keep "owing" a
+    // flush that can never happen.
+    dirtyProjects.clear();
+    return;
+  }
+  if (dirtyProjects.size === 0) return;
   for (const pid of dirtyProjects) {
     const m = memIndex.get(pid);
     if (!m) continue;
@@ -123,12 +124,43 @@ function flushNow() {
   dirtyProjects.clear();
 }
 
+// Module init: install the `pagehide` flush listener exactly once per tab.
+// `pagehide` fires reliably on mobile, on tab close, and is bfcache-friendly
+// (unlike `beforeunload`, which Safari mobile ignores and which blocks
+// bfcache participation). This closes the TUS-004 window where a completion
+// lands in the in-memory Map inside the 1 s debounce interval and a reload
+// then drops it before it hits disk.
+function ensurePagehideListener() {
+  if (_listenerRegistered) return;
+  if (typeof window === "undefined") return;
+  window.addEventListener("pagehide", flushNow);
+  _listenerRegistered = true;
+}
+ensurePagehideListener();
+
+function scheduleFlush() {
+  if (!hasStorage()) return;
+  // Defensive: module init already ran, but if this module is evaluated in
+  // an environment where `window` arrived late (SSR hydration edge cases),
+  // make sure the listener is attached before any dirty writes accumulate.
+  ensurePagehideListener();
+  if (flushTimer != null) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    flushNow();
+  }, FLUSH_DEBOUNCE_MS);
+}
+
 // Exposed for tests — forces a synchronous flush of any pending writes.
+// Kept as a separate export (in addition to `flushNow`) so existing test
+// call sites keep working without churn.
 export function _flushForTests() {
   flushNow();
 }
 
 // Exposed for tests — wipes in-memory state so a test can start fresh.
+// Does NOT un-register the `pagehide` listener: that's module-scoped by
+// design and is what _listenerRegisteredForTests() inspects.
 export function _resetForTests() {
   if (flushTimer != null) {
     clearTimeout(flushTimer);
@@ -136,6 +168,12 @@ export function _resetForTests() {
   }
   memIndex.clear();
   dirtyProjects.clear();
+}
+
+// Exposed for tests — lets the suite assert the listener registration is
+// a once-per-tab invariant rather than re-registering on every mount.
+export function _listenerRegisteredForTests() {
+  return _listenerRegistered;
 }
 
 /**

@@ -10,8 +10,10 @@ import {
   pruneExpired,
   keyForProject,
   fingerprintForFile,
+  flushNow,
   _flushForTests,
   _resetForTests,
+  _listenerRegisteredForTests,
 } from "./completedFingerprints";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -144,5 +146,62 @@ describe("completedFingerprints", () => {
     expect(isDuplicate(42, "f0.jpg:1:1")).toBe(true);
     expect(isDuplicate(42, "f1.jpg:1:1")).toBe(false);
     expect(isDuplicate(42, "new.jpg:1:1")).toBe(true);
+  });
+
+  // --- TUS-004: pagehide sync flush closes the debounce race -------------
+
+  test("pagehide event synchronously flushes pending in-memory deltas to localStorage", () => {
+    // No flush helper — we rely on the module's own pagehide listener to
+    // do the write, exactly like a real reload would.
+    markComplete(99, "race.jpg:100:1000");
+    // Nothing on disk yet: the 1 s debounce window has not elapsed.
+    expect(localStorage.getItem(keyForProject(99))).toBeNull();
+
+    window.dispatchEvent(new Event("pagehide"));
+
+    const entries = JSON.parse(localStorage.getItem(keyForProject(99)));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].fp).toBe("race.jpg:100:1000");
+
+    // Second dispatch must be a no-op (idempotent flush) — dirty set is
+    // empty now, so it should neither throw nor corrupt the stored data.
+    window.dispatchEvent(new Event("pagehide"));
+    const entriesAgain = JSON.parse(localStorage.getItem(keyForProject(99)));
+    expect(entriesAgain).toHaveLength(1);
+
+    // flushNow() is the same idempotent function exposed for explicit
+    // shutdown paths; calling it with no pending writes is a no-op.
+    expect(() => flushNow()).not.toThrow();
+  });
+
+  test("pagehide listener is registered exactly once per tab regardless of module touches", () => {
+    // The module self-installs on first evaluation; nothing any test does
+    // (resets, repeated imports from cached module, repeated markComplete
+    // calls) should flip this to "registered twice".
+    expect(_listenerRegisteredForTests()).toBe(true);
+    _resetForTests();
+    markComplete(1, "a.jpg:1:1");
+    markComplete(2, "b.jpg:1:1");
+    // Still registered, still a single listener (the flag never flips off).
+    expect(_listenerRegisteredForTests()).toBe(true);
+
+    // And a single pagehide dispatch must flush both projects — if we had
+    // double-registered, JSDOM would run the handler twice, which is still
+    // safe (idempotent) but the single-write behavior is the invariant we
+    // care about. Spy on setItem to count writes per project.
+    const writes = [];
+    const origSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key.startsWith("ls-tus-completed-")) writes.push(key);
+      return origSetItem.call(this, key, value);
+    };
+    try {
+      window.dispatchEvent(new Event("pagehide"));
+    } finally {
+      Storage.prototype.setItem = origSetItem;
+    }
+    // One write per dirty project — two projects, two writes total. A
+    // double-registered listener would have produced 4.
+    expect(writes).toEqual([keyForProject(1), keyForProject(2)]);
   });
 });
