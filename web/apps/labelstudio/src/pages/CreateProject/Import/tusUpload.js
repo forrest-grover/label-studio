@@ -11,6 +11,7 @@
 
 import * as tus from "tus-js-client";
 import PQueue from "p-queue";
+import { fingerprintForFile, markComplete } from "./completedFingerprints";
 
 export const CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB — see design doc §A3
 export const CONCURRENCY = 4; // §A2
@@ -86,6 +87,18 @@ export function uploadFileTus({
       },
       onSuccess: async () => {
         try {
+          // Record completion BEFORE tus-js-client's `removeFingerprintOnSuccess`
+          // wipes its own fingerprint entry. The post-success localStorage
+          // cleanup is synchronous in tus-js-client, but we run it in this
+          // ordering regardless so the write is never racing the cleanup (see
+          // TUS-001). The key here is independent of tus's internal
+          // fingerprint — it's `<name>:<size>:<lastModified>` so we can
+          // reproduce it from a raw File object at enqueue time.
+          try {
+            markComplete(projectId, fingerprintForFile(file));
+          } catch (_) {
+            /* best-effort; never fail an upload over a localStorage quirk */
+          }
           // Final URL is stored on the upload instance once the CREATE resolved.
           const url = upload.url;
           lastReportedUrl = url;

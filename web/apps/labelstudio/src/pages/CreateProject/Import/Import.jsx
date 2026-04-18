@@ -17,6 +17,7 @@ import { importFiles } from "./utils";
 import { iterateFileTree } from "./fileTraversal";
 import { createUploadQueue, uploadFileTus } from "./tusUpload";
 import { recordInflight, removeInflight, getInflight, clearInflight } from "./tusResume";
+import { fingerprintForFile, isDuplicate, pruneExpired } from "./completedFingerprints";
 
 const importClass = cn("upload_page");
 const dropzoneClass = cn("dropzone");
@@ -115,9 +116,9 @@ const ErrorMessage = ({ error }) => {
 
 // Aggregate byte-transfer summary shown above the per-file list. See
 // UPLOAD_FIX_DESIGN.md §A5.
-const UploadProgressHeader = ({ stats, failedCount, onRetryAll }) => {
+const UploadProgressHeader = ({ stats, failedCount, onRetryAll, skippedCount = 0 }) => {
   const hasTotals = stats && stats.totalFiles > 0;
-  if (!hasTotals && !failedCount) return null;
+  if (!hasTotals && !failedCount && !skippedCount) return null;
   const remaining = Math.max(0, stats.totalBytes - stats.doneBytes);
   let etaLabel = null;
   if (hasTotals && stats.doneBytes > 0 && stats.startedAt) {
@@ -140,11 +141,24 @@ const UploadProgressHeader = ({ stats, failedCount, onRetryAll }) => {
       data-testid="tus-aggregate-header"
     >
       <Typography variant="body" size="small" className="flex-1">
-        {stats.doneFiles} of {stats.totalFiles} files{" "}
-        <span className="text-neutral-content-subtle">
-          | {doneFmt} / {totalFmt}
-          {etaLabel ? ` | ${etaLabel}` : ""}
-        </span>
+        {hasTotals ? (
+          <>
+            {stats.doneFiles} of {stats.totalFiles} files{" "}
+            <span className="text-neutral-content-subtle">
+              | {doneFmt} / {totalFmt}
+              {etaLabel ? ` | ${etaLabel}` : ""}
+              {skippedCount > 0
+                ? ` | ${skippedCount} skipped as already uploaded`
+                : ""}
+            </span>
+          </>
+        ) : (
+          skippedCount > 0 && (
+            <span className="text-neutral-content-subtle">
+              {skippedCount} file{skippedCount === 1 ? "" : "s"} skipped as already uploaded
+            </span>
+          )
+        )}
       </Typography>
       {failedCount > 0 && (
         <>
@@ -317,12 +331,18 @@ export const ImportPage = ({
   // the resume banner must render even when no files are attached yet, so the
   // user has a recovery path immediately after a page reload.
   const [interrupted, setInterrupted] = useState([]);
+  // Per-drop skipped-as-duplicate counter. Resets each call to consumeItems so
+  // the user sees "N queued, M skipped as already uploaded" for each drop,
+  // not a lifetime total. See TUS-001. Declared before `showList` so a drop
+  // of files that are ALL already-uploaded still flips the header into view.
+  const [lastDropSkipped, setLastDropSkipped] = useState(0);
   const showList = Boolean(
     files.uploaded?.length
     || files.uploading?.length
     || files.failed?.length
     || sample
-    || interrupted.length,
+    || interrupted.length
+    || lastDropSkipped,
   );
 
   // Abort controller + queue live across the lifetime of the modal instance.
@@ -355,6 +375,16 @@ export const ImportPage = ({
     if (!project?.id) return;
     setInterrupted(getInflight(project.id));
   }, [project?.id]);
+
+  // Evict fingerprint entries older than 7 days once per Import-page mount
+  // (TUS-001). Cheap — scans only ls-tus-completed-* keys.
+  useEffect(() => {
+    try {
+      pruneExpired();
+    } catch (_) {
+      /* best-effort */
+    }
+  }, []);
 
   const loadFilesList = useCallback(
     async (file_upload_ids) => {
@@ -464,6 +494,19 @@ export const ImportPage = ({
         onError(new Error(`The filetype of file "${file.name}" is not supported.`));
         return Promise.resolve(null);
       }
+      // TUS-001: skip files that already completed in a prior session. The
+      // completed-fingerprint index is per-project and TTL'd; see
+      // completedFingerprints.js. We log via console.info (same channel
+      // neighbouring upload code uses for skip/error diagnostics) and bump
+      // the per-drop skipped counter so the user can see how many files
+      // were dropped-but-not-enqueued on this drop.
+      if (project?.id != null && isDuplicate(project.id, fingerprintForFile(file))) {
+        console.info(
+          `[tus] skipping "${file.name}" — already uploaded to project ${project.id} within the last 7 days`,
+        );
+        setLastDropSkipped((n) => n + 1);
+        return Promise.resolve(null);
+      }
       // Stable unique key for reducer indexing. Filenames alone are not unique
       // when a user drags in e.g. 10 subdirs that each contain `img_001.png`.
       // File objects are frozen so we install the key via defineProperty with
@@ -558,6 +601,9 @@ export const ImportPage = ({
     async (items) => {
       setError(null);
       onWaiting?.(true);
+      // Reset per-drop skipped counter — lastDropSkipped shows "M skipped as
+      // already uploaded" for the current drop only. See TUS-001.
+      setLastDropSkipped(0);
       let any = false;
       try {
         for await (const file of iterateFileTree(items)) {
@@ -844,7 +890,12 @@ export const ImportPage = ({
                     </Button>
                   </div>
                 )}
-                <UploadProgressHeader stats={files.stats} failedCount={files.failed.length} onRetryAll={retryAllFailed} />
+                <UploadProgressHeader
+                  stats={files.stats}
+                  failedCount={files.failed.length}
+                  onRetryAll={retryAllFailed}
+                  skippedCount={lastDropSkipped}
+                />
                 <SimpleCard
                   title="Files"
                   className="w-full h-full"
