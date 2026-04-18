@@ -558,6 +558,9 @@ TUS_DESTINATION_DIR = get_env('TUS_DESTINATION_DIR', os.path.join(MEDIA_ROOT, 't
 os.makedirs(TUS_DESTINATION_DIR, exist_ok=True)
 # Max time a partial upload lives before being evicted (seconds).
 TUS_TIMEOUT = int(get_env('TUS_TIMEOUT', 24 * 60 * 60))  # 24h
+# Orphan janitor: delete .meta/.data pairs whose .meta mtime is older than this
+# many days (see data_import/tus_app/janitor.py and TUS-003).
+TUS_ORPHAN_TTL_DAYS = int(get_env('TUS_ORPHAN_TTL_DAYS', 7))
 TASKS_MAX_FILE_SIZE = DATA_UPLOAD_MAX_MEMORY_SIZE
 
 TASK_LOCK_TTL = int(get_env('TASK_LOCK_TTL', default=86400))
