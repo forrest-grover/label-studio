@@ -5,6 +5,7 @@ When tus has assembled a complete temp file we mint a ``FileUpload`` row using
 endpoint uses — so the downstream Import / reimport flow sees an identical row.
 """
 
+import hashlib
 import logging
 import os
 from datetime import timedelta
@@ -22,6 +23,30 @@ from .signals import tus_upload_finished_signal
 
 logger = logging.getLogger(__name__)
 
+# FileUpload.fingerprint is `max_length=512`. The client sends a raw
+# `<name>:<size>:<lastModified>` blob (see completedFingerprints.js) — a pathological
+# filename longer than ~480 chars would overflow. We hash-on-receive so identical
+# long names still collide deterministically for dedup and the stored value is
+# always well within the column width. Also sidesteps the `:` delimiter ambiguity
+# the client separately guards (CF-FP-6) — the server never re-parses the blob.
+FINGERPRINT_MAX_RAW_LEN = 512
+
+
+def _normalize_fingerprint(fp):
+    """Coerce empty/long fingerprints to a safe, queryable form.
+
+    Returns ``None`` for falsy input so ``_find_existing_fileupload`` short-circuits.
+    For over-length inputs returns ``sha256(fp).hexdigest()`` (64 chars); short
+    inputs pass through unchanged. Critically: both the writer (stamping onto the
+    new FileUpload row) and the reader (``_find_existing_fileupload``) run through
+    this helper, so a long-name dedup hit still resolves to the same stored value.
+    """
+    if not fp:
+        return None
+    if len(fp) > FINGERPRINT_MAX_RAW_LEN:
+        return hashlib.sha256(fp.encode('utf-8')).hexdigest()
+    return fp
+
 
 def _find_existing_fileupload(project_id: int, fingerprint: str):
     """Return the most-recent FileUpload matching (project_id, fingerprint)
@@ -35,9 +60,20 @@ def _find_existing_fileupload(project_id: int, fingerprint: str):
     has. Returning ``None`` is the happy path — dedup only kicks in on a true
     duplicate re-upload within the window.
     """
+    fingerprint = _normalize_fingerprint(fingerprint)
     if not fingerprint:
         return None
-    hours = int(getattr(settings, 'TUS_SERVER_DEDUP_WINDOW_HOURS', 24))
+    try:
+        hours = int(getattr(settings, 'TUS_SERVER_DEDUP_WINDOW_HOURS', 24))
+    except (TypeError, ValueError):
+        # Defensive: setting misconfigured to a non-int string. Fail-open to
+        # the documented default rather than raising mid-finalize — a bad
+        # setting shouldn't strand the client's upload.
+        logger.warning(
+            'TUS_SERVER_DEDUP_WINDOW_HOURS=%r not an int; falling back to 24',
+            getattr(settings, 'TUS_SERVER_DEDUP_WINDOW_HOURS', None),
+        )
+        hours = 24
     cutoff = timezone.now() - timedelta(hours=hours)
     return (
         FileUpload.objects.filter(
@@ -60,8 +96,10 @@ def on_tus_upload_finished(sender, **kwargs):
     project_id = metadata.get('projectId')
     # Client-computed dedup key `<name>:<size>:<lastModified>`; may be absent
     # on older clients — in which case we simply skip dedup and behave as
-    # before (no breakage, no dedup benefit).
-    fingerprint = metadata.get('lsFingerprint') or None
+    # before (no breakage, no dedup benefit). Normalized (sha256 if over the
+    # column width) so downstream save() and query both use the same canonical
+    # value.
+    fingerprint = _normalize_fingerprint(metadata.get('lsFingerprint'))
 
     if not project_id:
         logger.error('tus finalize: missing projectId in metadata for %s', resource_id)
@@ -69,7 +107,21 @@ def on_tus_upload_finished(sender, **kwargs):
         return
 
     try:
-        project = Project.objects.get(pk=int(project_id))
+        project_pk = int(project_id)
+    except (TypeError, ValueError):
+        # RX-ERR-3: a non-integer projectId would otherwise escape as an
+        # unhandled ValueError — cleaner to log, drop the temp file, and bail
+        # so the signal framework doesn't surface a 500 for a client-supplied
+        # bad value.
+        logger.error(
+            'tus finalize: invalid projectId %r in metadata (resource %s)',
+            project_id, resource_id,
+        )
+        _safe_remove(upload_file_path)
+        return
+
+    try:
+        project = Project.objects.get(pk=project_pk)
     except Project.DoesNotExist:
         logger.error('tus finalize: project %s not found (resource %s)', project_id, resource_id)
         _safe_remove(upload_file_path)
@@ -80,7 +132,7 @@ def on_tus_upload_finished(sender, **kwargs):
     # — the client just gets back the existing FileUpload id via the same
     # .done-marker channel, so the rest of the import flow is indistinguishable
     # from a first-time upload.
-    existing = _find_existing_fileupload(int(project_id), fingerprint)
+    existing = _find_existing_fileupload(project_pk, fingerprint)
     if existing is not None:
         logger.info(
             'tus finalize: dedup hit project=%s fingerprint=%s -> reusing FileUpload id=%s '
@@ -130,13 +182,20 @@ def _write_done_marker(resource_id, file_upload_id):
     endpoint. Extracted so both the happy path and the TUS-005 dedup-hit path
     produce the same handshake — the client never needs to know whether its
     finalize was deduped.
+
+    RX-ERR-5: if the marker write fails we re-raise. The client polls for this
+    file to learn the FileUpload id; silently swallowing the OSError leaves the
+    client stalling forever. Propagating surfaces the failure via the tus
+    signal-sender error path (500 response) so the client retry logic can kick
+    in.
     """
     try:
         done_path = os.path.join(settings.TUS_UPLOAD_DIR, f'{resource_id}.done')
         with open(done_path, 'w', encoding='utf-8') as f:
             f.write(str(file_upload_id))
     except OSError:
-        logger.warning('tus finalize: failed to write .done marker for %s', resource_id)
+        logger.exception('tus finalize: failed to write .done marker for %s', resource_id)
+        raise
 
 
 def _safe_remove(path):
