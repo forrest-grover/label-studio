@@ -11,10 +11,15 @@
  * (TUS-001).
  *
  * Shape:   localStorage[`ls-tus-completed-<projectId>`] = [{ fp, ts }, ...]
- * Key:     `${name}:${size}:${lastModified}` — the ticket spec's dedup key.
+ * Key:     `${size}|${lastModified}|${name}` — the ticket spec's dedup key.
+ *          Name is placed last (as suffix, not between delimiters) so names
+ *          containing `|` or `:` cannot create parse ambiguity (CF-FP-6).
  *          This is intentionally independent of tus-js-client's internal
  *          fingerprint format so we can compute it from a raw File at
- *          enqueue time without touching tus internals.
+ *          enqueue time without touching tus internals. The server treats
+ *          the value as an opaque string (equality only), so changing the
+ *          client formula is safe — existing server rows simply won't
+ *          dedup-match until a re-upload populates a new-format row.
  * TTL:     7 days. `pruneExpired` walks every `ls-tus-completed-*` key and
  *          evicts stale entries; called once per Import-page mount.
  * Cap:     MAX_ENTRIES per project. FIFO eviction of the oldest entries when
@@ -184,7 +189,9 @@ export function fingerprintForFile(file) {
   // `lastModified` is part of the W3C File interface; falls back to 0 for the
   // rare File-like object that omits it (some drag-drop synthetic payloads).
   const lm = typeof file?.lastModified === "number" ? file.lastModified : 0;
-  return `${file?.name ?? ""}:${file?.size ?? 0}:${lm}`;
+  // Size + lastModified first so the name-as-suffix can safely contain any
+  // character (colon, pipe, etc.) without introducing parse ambiguity.
+  return `${file?.size ?? 0}|${lm}|${file?.name ?? ""}`;
 }
 
 /**

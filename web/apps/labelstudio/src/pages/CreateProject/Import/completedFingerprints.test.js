@@ -104,14 +104,14 @@ describe("completedFingerprints", () => {
     expect(isDuplicate(7, "a.jpg:100:1000")).toBe(true);
   });
 
-  test("fingerprintForFile uses <name>:<size>:<lastModified>", () => {
+  test("fingerprintForFile uses <size>|<lastModified>|<name>", () => {
     const f = { name: "a.jpg", size: 100, lastModified: 12345 };
-    expect(fingerprintForFile(f)).toBe("a.jpg:100:12345");
+    expect(fingerprintForFile(f)).toBe("100|12345|a.jpg");
   });
 
   test("fingerprintForFile falls back to 0 for missing lastModified", () => {
     const f = { name: "a.jpg", size: 100 };
-    expect(fingerprintForFile(f)).toBe("a.jpg:100:0");
+    expect(fingerprintForFile(f)).toBe("100|0|a.jpg");
   });
 
   // --- TUS-002: per-project cap + FIFO eviction ---------------------------
