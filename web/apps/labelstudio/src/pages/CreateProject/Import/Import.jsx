@@ -16,7 +16,8 @@ import { importFiles } from "./utils";
 import { iterateFileTree } from "./fileTraversal";
 import { createUploadQueue, uploadFileTus } from "./tusUpload";
 import { recordInflight, removeInflight, getInflight, clearInflight } from "./tusResume";
-import { fingerprintForFile, isDuplicate, pruneExpired } from "./completedFingerprints";
+import { pruneExpired } from "./completedFingerprints";
+import { createProcessFiles, initialReducerState, shouldSkipAsDuplicate } from "./Import.reducer";
 
 const importClass = cn("upload_page");
 const dropzoneClass = cn("dropzone");
@@ -194,163 +195,19 @@ export const ImportPage = ({
   const projectConfigured = project?.label_config !== "<View></View>";
   const sampleConfig = useAtomValue(sampleDatasetAtom);
 
-  const processFiles = (state, action) => {
-    if (action.sending) {
-      return { ...state, uploading: [...action.sending, ...state.uploading] };
-    }
-    if (action.sent) {
-      // `action.sent` is an array of File objects that just finished. Remove
-      // them from `uploading` AND clear any stale progress/failed entries so
-      // successful rows don't linger as failures. Fold their final `loaded`
-      // byte count into `stats.completedBytes` so the aggregate doneBytes
-      // stays cumulative even after we drop the entries (otherwise the
-      // "X / Y" byte readout jumps back to ~zero each time a batch finishes
-      // and the ETA becomes nonsense).
-      //
-      // Indexing by `_tusKey` (a monotonic counter attached at enqueue time),
-      // NOT by `file.name` — 8000-image stress datasets routinely have
-      // duplicate basenames across subdirectories (w0/img_001.png,
-      // w1/img_001.png, ...). Indexing by name conflates them: finishing one
-      // would remove all of them from `uploading` and double-count their
-      // bytes in completedBytes.
-      const sentKeys = new Set(action.sent.map((f) => f._tusKey));
-      const progress = { ...state.progress };
-      let sentBytes = 0;
-      for (const k of sentKeys) {
-        const p = progress[k];
-        if (p) sentBytes += p.loaded || 0;
-        delete progress[k];
-      }
-      return {
-        ...state,
-        uploading: state.uploading.filter((f) => !sentKeys.has(f._tusKey)),
-        failed: state.failed.filter((e) => !sentKeys.has(e.file._tusKey)),
-        progress,
-        stats: {
-          ...state.stats,
-          completedBytes: (state.stats.completedBytes || 0) + sentBytes,
-        },
-      };
-    }
-    if (action.uploaded) {
-      // TUS-002: use a Set for O(1) id-dedup. The legacy
-      // `unique(list, eq)` helper does a reduce+findIndex pass, which is
-      // O(N^2) in the size of the resulting list. For a 7980-file Tier-4
-      // upload this reducer runs once per tus success, so the total
-      // dedup work grows as O(N^3) and dominates the second-half
-      // throughput floor (measured: rate30 falls from ~8 f/s at
-      // N=200 to ~2 f/s at N=5000 with nothing else changing).
-      const seen = new Set();
-      const merged = [];
-      for (const arr of [state.uploaded, action.uploaded]) {
-        for (const item of arr) {
-          const id = item?.id;
-          if (id == null || seen.has(id)) continue;
-          seen.add(id);
-          merged.push(item);
-        }
-      }
-      return { ...state, uploaded: merged };
-    }
-    if (action.ids) {
-      // TUS-002: same O(N^2) -> O(N) change as the `uploaded` branch. The
-      // `ids` list is used by onFileListUpdate and, via dispatchers for
-      // every completed upload, grows to N entries across a run.
-      const seen = new Set();
-      const ids = [];
-      for (const arr of [state.ids, action.ids]) {
-        for (const id of arr) {
-          if (id == null || seen.has(id)) continue;
-          seen.add(id);
-          ids.push(id);
-        }
-      }
-      onFileListUpdate?.(ids);
-      return { ...state, ids };
-    }
-    if (action.progress) {
-      const { key, loaded, total } = action.progress;
-      const nextProgress = { ...state.progress, [key]: { loaded, total } };
-      // doneBytes = bytes already committed (completedBytes) + bytes in-flight
-      // right now. This stays monotonically non-decreasing across the lifetime
-      // of a batch because completed files no longer appear in `progress`
-      // after the `sent` action folds their size into completedBytes.
-      let inflight = 0;
-      for (const p of Object.values(nextProgress)) {
-        inflight += p.loaded || 0;
-      }
-      const doneBytes = (state.stats.completedBytes || 0) + inflight;
-      return {
-        ...state,
-        progress: nextProgress,
-        stats: {
-          ...state.stats,
-          doneBytes,
-          // totalBytes is owned by bumpTotals, do not overwrite here.
-          startedAt: state.stats.startedAt || Date.now(),
-        },
-      };
-    }
-    if (action.failed) {
-      const { file, error } = action.failed;
-      return {
-        ...state,
-        uploading: state.uploading.filter((f) => f._tusKey !== file._tusKey),
-        failed: [
-          ...state.failed.filter((e) => e.file._tusKey !== file._tusKey),
-          { file, error: String(error?.message ?? error ?? "Upload failed"), retries: 0 },
-        ],
-      };
-    }
-    if (action.retry) {
-      return {
-        ...state,
-        failed: state.failed.filter((e) => e.file._tusKey !== action.retry._tusKey),
-      };
-    }
-    if (action.bumpTotals) {
-      return {
-        ...state,
-        stats: {
-          ...state.stats,
-          totalFiles: (state.stats.totalFiles || 0) + action.bumpTotals.files,
-          totalBytes: (state.stats.totalBytes || 0) + action.bumpTotals.bytes,
-          startedAt: state.stats.startedAt || Date.now(),
-        },
-      };
-    }
-    if (action.bumpDone) {
-      return {
-        ...state,
-        stats: {
-          ...state.stats,
-          doneFiles: (state.stats.doneFiles || 0) + action.bumpDone,
-        },
-      };
-    }
-    if (action.resetStats) {
-      return { ...state, stats: initialStats(), progress: {} };
-    }
-    return state;
-  };
-
-  const initialStats = () => ({
-    totalFiles: 0,
-    doneFiles: 0,
-    totalBytes: 0,
-    doneBytes: 0,
-    completedBytes: 0, // cumulative bytes for already-finished files
-    startedAt: null,
-  });
-
-  const [files, dispatch] = useReducer(processFiles, {
-    uploaded: [],
-    uploading: [],
-    ids: [],
-    progress: {},
-    failed: [],
-    stats: initialStats(),
-  });
+  // processFiles reducer lives in Import.reducer.js — extracted so the full
+  // branch matrix (IR-UP-*, IR-IDS-*, IR-SE-*, IR-PR-*, IR-BT/BD/RS-*) can be
+  // unit-tested without mounting the Import component. `onFileListUpdate` is
+  // the only non-pure dep; the factory receives a getter that reads the latest
+  // callback via a ref so parent re-renders always see the current handler
+  // (matches pre-refactor closure-capture semantics).
+  const onFileListUpdateRef = useRef(onFileListUpdate);
+  onFileListUpdateRef.current = onFileListUpdate;
+  const processFilesRef = useRef(null);
+  if (processFilesRef.current === null) {
+    processFilesRef.current = createProcessFiles((ids) => onFileListUpdateRef.current?.(ids));
+  }
+  const [files, dispatch] = useReducer(processFilesRef.current, undefined, initialReducerState);
   // Resume-on-reload state (§A4). Declared up here so `showList` can include it —
   // the resume banner must render even when no files are attached yet, so the
   // user has a recovery path immediately after a page reload.
@@ -524,7 +381,7 @@ export const ImportPage = ({
       // neighbouring upload code uses for skip/error diagnostics) and bump
       // the per-drop skipped counter so the user can see how many files
       // were dropped-but-not-enqueued on this drop.
-      if (project?.id != null && isDuplicate(project.id, fingerprintForFile(file))) {
+      if (shouldSkipAsDuplicate(file, project?.id)) {
         console.info(
           `[tus] skipping "${file.name}" — already uploaded to project ${project.id} within the last 7 days`,
         );
