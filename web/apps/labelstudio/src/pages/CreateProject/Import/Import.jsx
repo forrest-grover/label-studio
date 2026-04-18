@@ -313,7 +313,17 @@ export const ImportPage = ({
     failed: [],
     stats: initialStats(),
   });
-  const showList = Boolean(files.uploaded?.length || files.uploading?.length || files.failed?.length || sample);
+  // Resume-on-reload state (§A4). Declared up here so `showList` can include it —
+  // the resume banner must render even when no files are attached yet, so the
+  // user has a recovery path immediately after a page reload.
+  const [interrupted, setInterrupted] = useState([]);
+  const showList = Boolean(
+    files.uploaded?.length
+    || files.uploading?.length
+    || files.failed?.length
+    || sample
+    || interrupted.length,
+  );
 
   // Abort controller + queue live across the lifetime of the modal instance.
   const uploadQueueRef = useRef(null);
@@ -339,8 +349,8 @@ export const ImportPage = ({
     };
   }, []);
 
-  // Resume-on-reload state (§A4).
-  const [interrupted, setInterrupted] = useState([]);
+  // Resume-on-reload effect (§A4). State declared earlier next to showList so
+  // the banner can gate showList before any files are attached.
   useEffect(() => {
     if (!project?.id) return;
     setInterrupted(getInflight(project.id));
