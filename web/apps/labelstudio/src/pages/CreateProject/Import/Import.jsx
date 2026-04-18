@@ -7,7 +7,6 @@ import Input from "libs/datamanager/src/components/Common/Input/Input";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useAPI } from "../../../providers/ApiProvider";
 import { cn } from "../../../utils/bem";
-import { unique } from "../../../utils/helpers";
 import { sampleDatasetAtom } from "../utils/atoms";
 import "./Import.prefix.css";
 import { Button, CodeBlock, SimpleCard, Spinner, Tooltip, Typography, Badge } from "@humansignal/ui";
@@ -234,13 +233,38 @@ export const ImportPage = ({
       };
     }
     if (action.uploaded) {
-      return {
-        ...state,
-        uploaded: unique([...state.uploaded, ...action.uploaded], (a, b) => a.id === b.id),
-      };
+      // TUS-002: use a Set for O(1) id-dedup. The legacy
+      // `unique(list, eq)` helper does a reduce+findIndex pass, which is
+      // O(N^2) in the size of the resulting list. For a 7980-file Tier-4
+      // upload this reducer runs once per tus success, so the total
+      // dedup work grows as O(N^3) and dominates the second-half
+      // throughput floor (measured: rate30 falls from ~8 f/s at
+      // N=200 to ~2 f/s at N=5000 with nothing else changing).
+      const seen = new Set();
+      const merged = [];
+      for (const arr of [state.uploaded, action.uploaded]) {
+        for (const item of arr) {
+          const id = item?.id;
+          if (id == null || seen.has(id)) continue;
+          seen.add(id);
+          merged.push(item);
+        }
+      }
+      return { ...state, uploaded: merged };
     }
     if (action.ids) {
-      const ids = unique([...state.ids, ...action.ids]);
+      // TUS-002: same O(N^2) -> O(N) change as the `uploaded` branch. The
+      // `ids` list is used by onFileListUpdate and, via dispatchers for
+      // every completed upload, grows to N entries across a run.
+      const seen = new Set();
+      const ids = [];
+      for (const arr of [state.ids, action.ids]) {
+        for (const id of arr) {
+          if (id == null || seen.has(id)) continue;
+          seen.add(id);
+          ids.push(id);
+        }
+      }
       onFileListUpdate?.(ids);
       return { ...state, ids };
     }
