@@ -1,12 +1,12 @@
 ---
 id: TUS-002
 title: Tier-4 second-half upload throughput degradation
-status: open
+status: done
 priority: P3
 area: both
 created: 2026-04-18
 related_branch: tus-upload
-related_commits: ""
+related_commits: "6c9e4d350 dee9c2a11 f3c2afcf2"
 ---
 
 ## Problem

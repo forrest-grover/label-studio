@@ -1,12 +1,12 @@
 ---
 id: TUS-001
 title: Resume banner allows duplicate uploads for completed files
-status: open
+status: done
 priority: P1
 area: frontend
 created: 2026-04-18
 related_branch: tus-upload
-related_commits: ""
+related_commits: "86617db3d"
 ---
 
 ## Problem

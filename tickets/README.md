@@ -27,6 +27,8 @@ Local ticket schema for post-initial-tus-upload work. One file per ticket.
 
 | ID | Title | Priority | Status |
 |---|---|---|---|
-| TUS-001 | Resume banner allows duplicate uploads | P1 | open |
-| TUS-002 | Tier-4 second-half throughput degradation | P3 | open |
-| TUS-003 | Janitor for orphaned tus temp files | P2 | open |
+| TUS-001 | Resume banner allows duplicate uploads | P1 | done |
+| TUS-002 | Tier-4 second-half throughput degradation | P3 | done |
+| TUS-003 | Janitor for orphaned tus temp files | P2 | done |
+| TUS-004 | Debounce flush race drops one completion on reload | P1 | done |
+| TUS-005 | Server-side fingerprint dedup for XHR-in-flight race | P1 | done |

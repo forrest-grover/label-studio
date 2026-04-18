@@ -1,12 +1,13 @@
 ---
 id: TUS-004
 title: Debounce flush race drops one completion on reload
-status: open
+status: done
 priority: P1
 area: frontend
 created: 2026-04-18
 related_branch: tus-upload
-related_commits: ""
+related_commits: "3b210d145"
+followup: "TUS-005 covers the remaining XHR-in-flight race not addressable from the frontend"
 ---
 
 ## Problem

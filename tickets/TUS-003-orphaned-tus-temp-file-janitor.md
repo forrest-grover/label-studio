@@ -1,12 +1,12 @@
 ---
 id: TUS-003
 title: Janitor for orphaned tus temp files on TUS_UPLOAD_DIR
-status: open
+status: done
 priority: P2
 area: backend
 created: 2026-04-18
 related_branch: tus-upload
-related_commits: ""
+related_commits: "3a8fbc7c4"
 ---
 
 ## Problem
