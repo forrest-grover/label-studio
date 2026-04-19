@@ -33,3 +33,4 @@ Local ticket schema for post-initial-tus-upload work. One file per ticket.
 | TUS-004 | Debounce flush race drops one completion on reload | P1 | done |
 | TUS-005 | Server-side fingerprint dedup for XHR-in-flight race | P1 | done |
 | TUS-006 | Convert fingerprint index to async migration pattern | P2 | open |
+| TUS-007 | Janitor crashes on TUS_UPLOAD_DIR that is a file | P3 | open |
