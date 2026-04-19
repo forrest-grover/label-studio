@@ -410,6 +410,12 @@ Impossible states pruned:
 - All `lastDropSkipped` render states — **IR-SK-1..6** (P2): no render tests
 - `pruneExpired` on mount — **IE-PR-1..3** (P2)
 
+> Deferred render tests (IR-SK-1..6, IE-PR-1..3) require the full Label Studio shell
+> to mount. Per `.cursor/rules/cypress_tests.mdc`, these belong in
+> `web/libs/editor/tests/integration/e2e/` (NOT co-located next to the component),
+> using helpers from `@humansignal/frontend-test/helpers/LSF` and data fixtures
+> under `web/libs/editor/tests/integration/data/`. File as `.cy.ts`.
+
 ### Backend (`janitor.py`)
 
 - **JN-3** (P1): exact TTL-second boundary — `>=` comparison; off-by-one
