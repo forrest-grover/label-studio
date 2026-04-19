@@ -14,6 +14,7 @@ import {
   _flushForTests,
   _resetForTests,
   _listenerRegisteredForTests,
+  _memIndexHasForTests,
 } from "./completedFingerprints";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -596,5 +597,155 @@ describe("completedFingerprints", () => {
       Storage.prototype.getItem = origGetItem;
     }
     expect(reads).toEqual([]);
+  });
+
+  test("CF-MC-10: markComplete creates the key when localStorage is empty", () => {
+    // Empty disk + empty memIndex: markComplete must hydrate an empty Map,
+    // insert the new entry, and (after debounce flush) write a fresh array
+    // with a single {fp, ts} object to the project key.
+    expect(localStorage.getItem(keyForProject(42))).toBeNull();
+    const before = Date.now();
+    markComplete(42, "fp1");
+    _flushForTests();
+    const after = Date.now();
+    const entries = JSON.parse(localStorage.getItem(keyForProject(42)));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].fp).toBe("fp1");
+    expect(typeof entries[0].ts).toBe("number");
+    expect(entries[0].ts).toBeGreaterThanOrEqual(before);
+    expect(entries[0].ts).toBeLessThanOrEqual(after);
+  });
+
+  test("CF-PH-4: scheduleFlush's ensurePagehideListener re-check does not double-register", () => {
+    // Module init already registered the pagehide listener before any test
+    // ran (_listenerRegistered=true). _resetForTests intentionally leaves
+    // that flag set, so scheduleFlush's defensive ensurePagehideListener
+    // call must short-circuit. Spy on addEventListener for 'pagehide' and
+    // confirm no new registration happens across two markComplete calls
+    // for different projects.
+    _resetForTests();
+    expect(_listenerRegisteredForTests()).toBe(true);
+    const pagehideRegistrations = [];
+    const origAdd = window.addEventListener;
+    window.addEventListener = function (type, listener, opts) {
+      if (type === "pagehide") pagehideRegistrations.push(listener);
+      return origAdd.call(this, type, listener, opts);
+    };
+    try {
+      markComplete(1, "a|1|n");
+      markComplete(2, "b|1|n");
+    } finally {
+      window.addEventListener = origAdd;
+    }
+    // The guard fires: zero new 'pagehide' registrations during scheduleFlush
+    // (the single module-init registration is the one-and-only listener for
+    // this tab's lifetime).
+    expect(pagehideRegistrations).toHaveLength(0);
+    expect(_listenerRegisteredForTests()).toBe(true);
+  });
+
+  test("CF-PE-10: numeric-string pidStr is coerced to Number for memIndex.delete", () => {
+    // Seed disk with an all-stale entry under a numeric project id.
+    // isDuplicate(7, …) hydrates memIndex with the numeric key 7 (projectId
+    // is passed as a Number by callers). pruneExpired then reads the
+    // localStorage key back as the string "7" and must Number()-coerce it
+    // so memIndex.delete(7) hits the same entry that hydrate wrote.
+    const staleTs = Date.now() - 30 * DAY;
+    localStorage.setItem(
+      keyForProject(7),
+      JSON.stringify([{ fp: "x", ts: staleTs }]),
+    );
+    expect(isDuplicate(7, "x")).toBe(false); // hydrate with numeric key 7
+    expect(_memIndexHasForTests(7)).toBe(true);
+    pruneExpired();
+    // Numeric key removed by Number("7") coercion; the string-keyed entry
+    // was never created so it should remain absent.
+    expect(_memIndexHasForTests(7)).toBe(false);
+    expect(_memIndexHasForTests("7")).toBe(false);
+  });
+
+  test("CF-PE-11: non-numeric pidStr left as string for memIndex.delete", () => {
+    // Project slugs (non-digit strings) must NOT be coerced — Number("abc")
+    // is NaN and would silently fail to match a hydrated string key. The
+    // production guard `/^\d+$/.test(pidStr) ? Number(pidStr) : pidStr`
+    // preserves the string form on the non-numeric branch. This test pins
+    // that invariant and plants a NaN-keyed decoy to confirm the non-
+    // numeric path does NOT accidentally purge a numeric key via NaN.
+    const staleTs = Date.now() - 30 * DAY;
+    localStorage.setItem(
+      `ls-tus-completed-abc`,
+      JSON.stringify([{ fp: "x", ts: staleTs }]),
+    );
+    expect(isDuplicate("abc", "x")).toBe(false); // hydrate with string key "abc"
+    expect(_memIndexHasForTests("abc")).toBe(true);
+    // Decoy: a direct NaN entry — if the code took the Number("abc") path
+    // by mistake, memIndex.delete(NaN) would purge this. (Map treats NaN
+    // as a valid key, equal to itself.)
+    isDuplicate(NaN, "y"); // hydrate empty Map under NaN key
+    expect(_memIndexHasForTests(NaN)).toBe(true);
+    pruneExpired();
+    // String key deleted via the non-numeric branch; NaN decoy survives
+    // because pidStr "abc" never coerced to NaN for the delete call.
+    expect(_memIndexHasForTests("abc")).toBe(false);
+    expect(_memIndexHasForTests(NaN)).toBe(true);
+    // Production behavior matches matrix spec — no bug to follow up on.
+  });
+
+  test("CF-HY-3: hydrate skips malformed entries (missing fp)", () => {
+    // Mix one malformed entry (no fp) with one good entry; hydrate must
+    // silently drop the malformed one. Verify via isDuplicate results.
+    const now = Date.now();
+    localStorage.setItem(
+      keyForProject(1),
+      JSON.stringify([
+        { ts: now }, // malformed: missing fp
+        { fp: "x", ts: now },
+      ]),
+    );
+    expect(isDuplicate(1, "x")).toBe(true);
+    // The malformed entry's implicit fp (undefined) returns false via
+    // the isDuplicate `!fingerprint` guard, so confirm directly that the
+    // Map holds exactly one entry by checking a sibling fingerprint that
+    // would have been present if the malformed entry had been accepted.
+    // Re-mark and flush to inspect the serialized array length.
+    markComplete(1, "y|1|n");
+    _flushForTests();
+    const entries = JSON.parse(localStorage.getItem(keyForProject(1)));
+    // Only the hydrated "x" and the newly-added "y|1|n" — never the
+    // malformed (fp-less) entry.
+    expect(entries.map((e) => e.fp).sort()).toEqual(["x", "y|1|n"]);
+  });
+
+  test("CF-HY-4: hydrate with hasStorage() false returns empty Map without throwing", () => {
+    _resetForTests();
+    const origWindow = global.window;
+    // @ts-ignore
+    delete global.window;
+    try {
+      // hydrate → hasStorage() false → skip the for-loop → return empty Map.
+      // isDuplicate returns false because the Map has no entry for "fp".
+      expect(() => isDuplicate(1, "fp")).not.toThrow();
+      expect(isDuplicate(1, "fp")).toBe(false);
+      // memIndex still populated with an empty Map entry (hydrate caches).
+      expect(_memIndexHasForTests(1)).toBe(true);
+    } finally {
+      global.window = origWindow;
+    }
+  });
+
+  test("CF-HY-5: hydrate with localStorage key absent returns empty Map", () => {
+    // Empty localStorage: hydrate must still cache an empty Map so future
+    // lookups don't repeatedly re-read storage for known-absent projects.
+    expect(localStorage.getItem(keyForProject(99))).toBeNull();
+    expect(isDuplicate(99, "never-seen")).toBe(false);
+    // memIndex now has an empty Map entry for project 99.
+    expect(_memIndexHasForTests(99)).toBe(true);
+    // Corroborate by writing a new entry and flushing: the resulting disk
+    // array contains only the new entry — proof the Map was empty pre-mark.
+    markComplete(99, "fresh|1|n");
+    _flushForTests();
+    const entries = JSON.parse(localStorage.getItem(keyForProject(99)));
+    expect(entries).toHaveLength(1);
+    expect(entries[0].fp).toBe("fresh|1|n");
   });
 });

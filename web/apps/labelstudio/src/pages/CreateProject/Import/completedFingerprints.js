@@ -181,6 +181,14 @@ export function _listenerRegisteredForTests() {
   return _listenerRegistered;
 }
 
+// Exposed for tests — lets CF-PE-10/CF-PE-11 distinguish between numeric and
+// string project keys in the in-memory mirror (pruneExpired coerces numeric
+// pidStr via Number() but leaves non-numeric strings as-is; memIndex.delete
+// must match the hydrated key exactly). No public API exposes this check.
+export function _memIndexHasForTests(pid) {
+  return memIndex.has(pid);
+}
+
 /**
  * Compute the dedup fingerprint for a File. Exported so callers don't need to
  * duplicate the formula (and so there's one place to change it if needed).
