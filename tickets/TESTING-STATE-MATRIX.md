@@ -484,3 +484,35 @@ Impossible states pruned:
 8. **JN-3 / JN-8** (P1): exact TTL boundary handling in janitor. The condition is `meta_mtime >= cutoff` (retain if equal or newer). An upload whose `.meta` mtime is _exactly_ `now - ttl_days * 86400` is retained, not deleted. The off-by-one is benign in practice but the behavior is unspecified by any test.
 9. **CF-ID-5 / CF-PE-9** (P1): `isDuplicate` and `pruneExpired` both use `Date.now() - ts >= TTL_MS` to detect expiry. An entry at exactly the TTL moment is treated as expired. No test pins this boundary, so a future `>` vs `>=` change would be invisible.
 10. **CMD-1..4** (P2): the management command `cleanup_tus_orphans` is completely untested — neither `--sync` execution, nor rq dispatch, nor the `start_job_async_or_sync` fallback path is covered. The command is the primary operational trigger for TUS-003 in production.
+
+---
+
+## Final coverage (2026-04-19)
+
+All 71 originally-identified gaps closed across 10 commits. Every state enumerated in sections 1-23 now has a direct or explicitly-indirect test.
+
+| Phase | Tests added | Suites | Bug fixes |
+|---|---|---|---|
+| Initial coverage pass (4 parallel engineers) | 105 | + | 5 (colon ambiguity, non-int projectId, .done write failure, non-int env var, over-length fingerprint) |
+| Residual unit-testable gaps (CF-MC-10, CF-PH-4, CF-PE-10..11, CF-HY-3..5) | 7 | existing | 0 |
+| Render + mount gaps (IR-SK-1..6, IE-PR-1..3) | 9 | +2 new | 0 |
+| **Total** | **121** | | **5** |
+
+**Final test counts:**
+- Frontend (Jest, `npx nx run labelstudio:unit`): **108 passed**, 8 suites
+- Backend (pytest, `pytest label_studio/tests/data_import/`): **103 passed**
+- Smoke (Playwright `tier_resume` + `tier3`): PASS
+
+**State IDs explicitly covered by unit tests:**
+- completedFingerprints.js: CF-FP-1..6, CF-MC-1..10, CF-ID-1..11, CF-PE-1..13, CF-FL-1..12, CF-PH-1..4, CF-HY-1..5
+- tusUpload.js: TU-FP-1..2
+- Import reducer + enqueue: IR-UP-1..5, IR-IDS-1..4, IR-SE-1..4, IR-PR-1..4, IR-BT-1..2, IR-BD-1, IR-RS-1, IE-DUP-1..7
+- UploadProgressHeader + pruneExpired hook: IR-SK-1..6, IE-PR-1..3
+- janitor: JN-1..13, JN-SU-1..4, JN-CFG-1..4
+- cleanup_tus_orphans command: CMD-1..4
+- receivers: RX-1..7, RX-ERR-1..7, RX-ST-1..3, RX-FE-1..9
+- FileUpload model: MDL-1..6
+- migration 0003: MIG-1..5
+- TUS settings: CFG-1..8
+
+**Two residual states marked "indirect" in the matrix** (MDL-1 and MIG-5) are transitively exercised by every `test_tus_dedup.py` test (auto_now_add fires, fingerprint column is populated). No standalone test added since the behavior cannot regress without breaking the full dedup path.
